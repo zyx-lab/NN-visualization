@@ -1,0 +1,548 @@
+import React, { useState, useEffect } from 'react';
+import { Play, Pause, RefreshCw, ChevronRight, ChevronLeft, Info, Layers, ArrowRight, ArrowLeft } from 'lucide-react';
+
+// --- 最终版配色系统 ---
+const THEME = {
+  default: { stroke: '#e5e7eb', className: 'bg-white border border-gray-200 text-gray-800 transition-all duration-150' },
+  focus: { stroke: '#f97316', className: 'bg-white border-2 border-orange-500 text-orange-600 font-extrabold shadow-xl scale-110 z-50 ring-4 ring-orange-50' },
+  highlight: { stroke: '#4b5563', className: 'bg-white border-2 border-gray-600 text-gray-900 font-extrabold shadow-md scale-105 z-20' }
+};
+
+// --- 颜色定义 ---
+const PALETTE = {
+  blue: { hex: '#3b82f6', bg: 'bg-blue-50', text: 'text-blue-700', border: 'border-blue-500', badge: 'bg-blue-100 text-blue-700', highlight: 'bg-blue-100' },
+  cyan: { hex: '#06b6d4', bg: 'bg-cyan-50', text: 'text-cyan-700', border: 'border-cyan-500', badge: 'bg-cyan-100 text-cyan-700', highlight: 'bg-cyan-100' },
+  violet: { hex: '#8b5cf6', bg: 'bg-violet-50', text: 'text-violet-700', border: 'border-violet-500', badge: 'bg-violet-100 text-violet-700', highlight: 'bg-violet-100' },
+  emerald: { hex: '#10b981', bg: 'bg-emerald-50', text: 'text-emerald-700', border: 'border-emerald-500', badge: 'bg-emerald-100 text-emerald-700', highlight: 'bg-emerald-100' },
+  rose: { hex: '#f43f5e', bg: 'bg-rose-50', text: 'text-rose-700', border: 'border-rose-500', badge: 'bg-rose-100 text-rose-700', highlight: 'bg-rose-100' },
+  slate: { hex: '#64748b', bg: 'bg-slate-50', text: 'text-slate-600', border: 'border-slate-300', badge: 'bg-slate-100 text-slate-600', highlight: 'bg-slate-100' },
+  gray: { hex: '#e5e7eb', bg: 'bg-gray-50', text: 'text-gray-300', border: 'border-gray-200' } // 未激活状态
+};
+
+const COLOR_MAP = {
+  input: PALETTE.blue,
+  hidden: PALETTE.violet,
+  output: PALETTE.rose,
+  w1: PALETTE.blue,
+  w2: PALETTE.emerald,
+  neutral: PALETTE.slate
+};
+
+const getMatrixColor = (name) => {
+  if (name.includes('X')) return COLOR_MAP.input;
+  if (name.includes('W1') || name.includes('dW1')) return COLOR_MAP.w1;
+  if (name.includes('Z1') || name.includes('A1') || name.includes('dZ1') || name.includes('b1')) return COLOR_MAP.hidden;
+  if (name.includes('W2') || name.includes('dW2')) return COLOR_MAP.w2;
+  if (name.includes('Z2') || name.includes('A2') || name.includes('dZ2') || name.includes('b2') || name.includes('Y')) return COLOR_MAP.output;
+  return COLOR_MAP.neutral;
+};
+
+// --- 步骤可见性定义 (关键修改：控制每一层何时“亮起”) ---
+// 只要 stepIndex >= 某个阶段的 index，该组件就显示彩色，否则显示灰色
+const ACTIVATION_ORDER = {
+  input: 0,     // init
+  w1: 1,        // z1
+  hidden_z: 1,  // z1
+  hidden_a: 2,  // a1
+  w2: 3,        // z2
+  output: 3     // z2 (z2 & a2 share output nodes visually)
+};
+
+// --- 数学工具库 ---
+const MathUtils = {
+  dot: (a, b) => {
+    const rowsA = a.length;
+    const colsA = a[0].length;
+    const rowsB = b.length;
+    const colsB = b[0].length;
+    if (colsA !== rowsB) return null;
+    const result = Array(rowsA).fill(0).map(() => Array(colsB).fill(0));
+    for (let i = 0; i < rowsA; i++) {
+      for (let j = 0; j < colsB; j++) {
+        let sum = 0;
+        for (let k = 0; k < colsA; k++) {
+          sum += a[i][k] * b[k][j];
+        }
+        result[i][j] = parseFloat(sum.toFixed(2));
+      }
+    }
+    return result;
+  },
+  transpose: (a) => a[0].map((_, colIndex) => a.map(row => row[colIndex])),
+  addBias: (matrix, bias) => matrix.map((row, i) => row.map(val => parseFloat((val + bias[i][0]).toFixed(2)))),
+  subtract: (a, b) => a.map((row, i) => row.map((val, j) => parseFloat((val - b[i][j]).toFixed(2)))),
+  relu: (matrix) => matrix.map(row => row.map(x => Math.max(0, x))),
+  reluDeriv: (matrix) => matrix.map(row => row.map(x => x > 0 ? 1 : 0)),
+  sigmoid: (matrix) => matrix.map(row => row.map(x => parseFloat((1 / (1 + Math.exp(-x))).toFixed(2)))),
+  multiply: (a, b) => a.map((row, i) => row.map((val, j) => parseFloat((val * b[i][j]).toFixed(2)))),
+  scale: (matrix, scalar) => matrix.map(row => row.map(val => parseFloat((val * scalar).toFixed(3)))),
+  sumAxis1: (matrix) => matrix.map(row => [parseFloat(row.reduce((acc, val) => acc + val, 0).toFixed(2))])
+};
+
+const INITIAL_DATA = {
+  X: [[0.5, 1.0, -0.5], [0.2, -0.5, 0.8]], 
+  Y: [[1, 0, 1]], 
+  W1: [[0.1, 0.2], [-0.3, 0.4], [0.5, -0.1], [0.2, 0.2]], 
+  b1: [[0.1], [0.0], [-0.1], [0.1]], 
+  W2: [[0.2, -0.4, 0.5, -0.1]], 
+  b2: [[-0.2]] 
+};
+
+const BATCH_MATRICES = ['X', 'Y', 'Z1', 'A1', 'Z2', 'A2', 'dZ2', 'dZ1']; 
+const TRANSPOSED_MATRICES = ['A1_T', 'X_T', 'W2_T'];
+
+const STEPS = [
+  { id: 'init', title: 'Initialization', desc: '加载 3 个样本的输入数据 X (Batch Size=3)', type: 'setup', layer: 'Input', intuition: '准备好训练数据，每个样本都有不同的特征。' },
+  { id: 'z1', title: '前向传播: Z1', desc: 'Input -> Hidden (Linear Sum)', type: 'forward', formula: 'Z1 = W1 · X + b1', layer: 'Layer 1', intuition: '信号加权：输入特征 X 通过权重 W1 “投票” 给隐藏层神经元。权重越大，信号越强。' },
+  { id: 'a1', title: '前向传播: A1', desc: 'Hidden Activation (ReLU)', type: 'forward', formula: 'A1 = ReLU(Z1)', layer: 'Layer 1', intuition: '非线性激活：ReLU 就像一个门控，只有正的信号可以通过，负信号被拦截（置0）。' },
+  { id: 'z2', title: '前向传播: Z2', desc: 'Hidden -> Output (Linear Sum)', type: 'forward', formula: 'Z2 = W2 · A1 + b2', layer: 'Layer 2', intuition: '综合判断：隐藏层的信息再次加权汇总，准备做出最终预测。' },
+  { id: 'a2', title: '前向传播: A2', desc: 'Output Prediction (Sigmoid)', type: 'forward', formula: 'A2 = σ(Z2)', layer: 'Layer 2', intuition: '概率映射：将数值压缩到 0~1 之间，代表预测为正类的概率。' },
+  { id: 'loss', title: '计算 Loss', desc: 'Compare Prediction vs Truth', type: 'loss', formula: 'L = -(Y log A2...)', layer: 'Output', intuition: '衡量差距：预测结果 A2 离真实标签 Y 有多远？差距越大，Loss 越大。' },
+  { id: 'dz2', title: '反向传播: dZ2', desc: 'Output Error Gradient', type: 'backward', formula: 'dZ2 = A2 - Y', layer: 'Layer 2', intuition: '误差源头：这是预测值与真实值的直接差值。正值代表预测偏大，负值代表预测偏小。' },
+  { id: 'dw2', title: '反向传播: dW2', desc: 'Gradient for W2', type: 'backward', formula: 'dW2 = 1/m * dZ2 · A1^T', layer: 'Layer 2', intuition: '⚖️ 责任归因 (核心)：\n谁该为误差 dZ2 负责？\n如果某个隐藏神经元激活值 A1 很高，且造成了很大的误差 dZ2，那么连接它们的权重 W2 就有很大的“责任”。' },
+  { id: 'db2', title: '反向传播: db2', desc: 'Gradient for b2', type: 'backward', formula: 'db2 = sum(dZ2)', layer: 'Layer 2', intuition: '整体偏差：如果所有样本的预测普遍都偏高或偏低，我们就调整偏置项 b2 来整体平移预测结果。' },
+  { id: 'dz1', title: '反向传播: dZ1', desc: 'Backprop to Hidden', type: 'backward', formula: "dZ1 = W2^T · dZ2 * g'(Z1)", layer: 'Layer 1', intuition: '🌊 误差倒流 (核心)：\n输出层的误差 dZ2 沿着权重连线 W2 “反向流回” 隐藏层。' },
+  { id: 'dw1', title: '反向传播: dW1', desc: 'Gradient for W1', type: 'backward', formula: 'dW1 = 1/m * dZ1 · X^T', layer: 'Layer 1', intuition: '🔍 深层归因：\n基于传回来的隐藏层误差 dZ1，再次判断输入层权重 W1 该如何调整。' },
+];
+
+const NODES = {
+  input: [{x: 10, y: 35}, {x: 10, y: 65}],
+  hidden_z: [{x: 40, y: 20}, {x: 40, y: 40}, {x: 40, y: 60}, {x: 40, y: 80}],
+  hidden_a: [{x: 60, y: 20}, {x: 60, y: 40}, {x: 60, y: 60}, {x: 60, y: 80}],
+  output: [{x: 90, y: 50}]
+};
+
+export default function NeuralNetVis() {
+  const [currentStep, setCurrentStep] = useState(0);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [matrices, setMatrices] = useState({});
+  const [hoverInfo, setHoverInfo] = useState(null); 
+
+  useEffect(() => {
+    const { X, Y, W1, b1, W2, b2 } = INITIAL_DATA;
+    const m = X[0].length;
+    const Z1 = MathUtils.addBias(MathUtils.dot(W1, X), b1);
+    const A1 = MathUtils.relu(Z1);
+    const Z2 = MathUtils.addBias(MathUtils.dot(W2, A1), b2);
+    const A2 = MathUtils.sigmoid(Z2);
+    const dZ2 = MathUtils.subtract(A2, Y);
+    const A1_T = MathUtils.transpose(A1);
+    const dW2 = MathUtils.scale(MathUtils.dot(dZ2, A1_T), 1/m);
+    const db2 = MathUtils.scale(MathUtils.sumAxis1(dZ2), 1/m);
+    const W2_T = MathUtils.transpose(W2);
+    const Z1_deriv = MathUtils.reluDeriv(Z1);
+    const dZ1 = MathUtils.multiply(MathUtils.dot(W2_T, dZ2), Z1_deriv);
+    const X_T = MathUtils.transpose(X);
+    const dW1 = MathUtils.scale(MathUtils.dot(dZ1, X_T), 1/m);
+    setMatrices({ X, Y, W1, b1, W2, b2, Z1, A1, Z2, A2, dZ2, A1_T, dW2, db2, W2_T, dZ1, X_T, dW1 });
+  }, []);
+
+  useEffect(() => {
+    let interval;
+    if (isPlaying) {
+      interval = setInterval(() => {
+        setCurrentStep(prev => (prev >= STEPS.length - 1 ? (setIsPlaying(false), prev) : prev + 1));
+      }, 3000); 
+    }
+    return () => clearInterval(interval);
+  }, [isPlaying]);
+
+  const stepData = STEPS[currentStep];
+  const activeSample = hoverInfo && (BATCH_MATRICES.includes(hoverInfo.name) ? hoverInfo.col : (TRANSPOSED_MATRICES.includes(hoverInfo.name) ? hoverInfo.row : null));
+
+  // --- 判断组件是否在当前步骤已激活 (颜色逻辑) ---
+  const isLayerActive = (layerKey) => {
+    // 只要当前步骤索引 >= 该层激活索引，就显示颜色
+    return currentStep >= ACTIVATION_ORDER[layerKey];
+  };
+
+  // --- 连线样式计算 ---
+  const getLineStyle = (layerType, startNodeIndex, endNodeIndex) => {
+    const { id, type } = stepData;
+    const isForward = type === 'forward';
+    const isBackward = type === 'backward';
+    
+    // 1. 确定是否“点亮”（基于步骤进度）
+    let layerKey = layerType === 0 ? 'w1' : (layerType === 1 ? 'hidden_a' : 'w2'); // 0: W1, 1: A1, 2: W2
+    // 特殊情况：layerType 1 (Z->A) 算是 hidden_a 激活的一部分
+    
+    const isActiveInStep = isLayerActive(layerKey);
+
+    // 默认颜色 (灰色 or 本色)
+    let nativeColor = isActiveInStep 
+        ? (layerType === 0 ? COLOR_MAP.w1.hex : (layerType === 2 ? COLOR_MAP.w2.hex : COLOR_MAP.hidden.hex))
+        : '#e5e7eb'; // 灰色 (Gray-200) - 未激活状态
+
+    // 2. 基础属性
+    let stroke = nativeColor;
+    let strokeWidth = isActiveInStep ? 2 : 1.5;
+    let opacity = 1; // 默认完全不透明
+    let dash = 'none';
+    let animation = 'none';
+    let zIndex = 0;
+    
+    // 3. 步骤动画
+    const isStepActive = (
+      (layerType === 0 && ['z1', 'dw1', 'dz1'].includes(id)) ||
+      (layerType === 1 && ['a1', 'dz1'].includes(id)) ||
+      (layerType === 2 && ['z2', 'a2', 'loss', 'dz2', 'dw2', 'db2', 'dz1'].includes(id))
+    );
+
+    if (isStepActive) {
+       if (['dw1', 'dz1', 'dz2', 'dw2', 'db2'].includes(id)) { 
+          dash = '6,4';
+          animation = 'dash-reverse 1s linear infinite';
+       }
+    }
+
+    // 4. Hover 高亮 (覆盖以上逻辑)
+    if (hoverInfo) {
+      const { name, row, col, sources } = hoverInfo;
+      let isRelevant = false;
+
+      // Direct Hover
+      if (layerType === 0 && ['W1', 'dW1'].includes(name) && startNodeIndex === col && endNodeIndex === row) isRelevant = true;
+      if (layerType === 2 && ['W2', 'dW2'].includes(name) && startNodeIndex === col && endNodeIndex === row) isRelevant = true;
+
+      // Indirect Source
+      if (sources && !isRelevant) {
+        if (layerType === 0) {
+           const w1Source = sources.find(s => s.name === 'W1');
+           if (w1Source && w1Source.type === 'row' && endNodeIndex === row) isRelevant = true;
+        }
+        if (layerType === 2) {
+           const w2Source = sources.find(s => s.name === 'W2');
+           if (w2Source && w2Source.type === 'row' && endNodeIndex === row) isRelevant = true;
+           const w2TSource = sources.find(s => s.name === 'W2_T');
+           if (w2TSource && w2TSource.type === 'row' && startNodeIndex === row) isRelevant = true;
+        }
+      }
+
+      if (isRelevant) {
+        // 选中：加粗，高层级，如果是W1且选中保持蓝色
+        if (layerType === 0 && ['W1', 'dW1'].includes(name)) {
+           stroke = '#3b82f6'; // W1 Blue
+        } else {
+           // 使用 Theme highlight (Gray/Dark) 或 Focus (Orange)
+           // 保持代码简洁，这里用 Theme 逻辑的颜色，或者沿用 nativeColor
+           // 用户之前说 "选中W1...选中的权重依然用原来的颜色"
+           // 这里的 nativeColor 已经是本色了
+        }
+        strokeWidth = 4;
+        opacity = 1;
+        zIndex = 50;
+        dash = 'none'; // 选中时实线更清晰
+      } else {
+        // 未选中：大幅降低透明度
+        opacity = 0.2; 
+        animation = 'none';
+        strokeWidth = 1;
+      }
+    }
+
+    return { stroke, strokeWidth, strokeDasharray: dash, animation, opacity, zIndex };
+  };
+
+  // --- 节点样式计算 ---
+  const getNodeStyle = (layerName, index) => {
+    // 1. 判断是否激活 (步骤进度)
+    let layerKey = layerName;
+    const isActiveInStep = isLayerActive(layerKey);
+
+    // 2. 确定颜色配置
+    let conf = isActiveInStep ? COLOR_MAP.neutral : PALETTE.gray; // 默认为灰色
+    if (isActiveInStep) {
+        if (layerName === 'input') conf = COLOR_MAP.input;
+        if (layerName.includes('hidden')) conf = COLOR_MAP.hidden;
+        if (layerName === 'output') conf = COLOR_MAP.output;
+    }
+
+    // 3. 基础样式 (形状固定)
+    let shapeClass = layerName === 'hidden_z' ? "rounded" : "rounded-full";
+    let baseClass = `${shapeClass} border-2 ${conf.border} ${conf.bg} ${conf.text} flex items-center justify-center transition-all duration-300`;
+    
+    // 4. Hover 高亮
+    if (hoverInfo) {
+       const { name, row, col, sources } = hoverInfo;
+       let isRelevant = false;
+       
+       // Direct Self
+       if (layerName === 'input' && ['X'].includes(name) && row === index) isRelevant = true;
+       if (layerName === 'hidden_z' && ['Z1', 'dZ1'].includes(name) && row === index) isRelevant = true;
+       if (layerName === 'hidden_a' && ['A1'].includes(name) && row === index) isRelevant = true;
+       if (layerName === 'output' && ['Z2', 'A2', 'dZ2', 'Y'].includes(name) && row === index) isRelevant = true;
+
+       // Source
+       if (sources) {
+         const xSource = sources.find(s => s.name === 'X');
+         if (layerName === 'input' && xSource && xSource.type === 'col') isRelevant = true;
+         const xTSource = sources.find(s => s.name === 'X_T');
+         if (layerName === 'input' && xTSource && xTSource.type === 'col' && index === col) isRelevant = true;
+         const a1Source = sources.find(s => s.name === 'A1');
+         if (layerName === 'hidden_a' && a1Source && a1Source.type === 'col') isRelevant = true;
+         const a1TSource = sources.find(s => s.name === 'A1_T');
+         if (layerName === 'hidden_a' && a1TSource && a1TSource.type === 'col' && index === col) isRelevant = true;
+         const z1Source = sources.find(s => s.name === 'Z1');
+         if (layerName === 'hidden_z' && z1Source && z1Source.type === 'cell') isRelevant = true;
+         const z2Source = sources.find(s => s.name === 'Z2');
+         if (layerName === 'output' && z2Source && z2Source.type === 'cell') isRelevant = true;
+         const dz2Source = sources.find(s => s.name === 'dZ2');
+         if (layerName === 'output' && dz2Source && (dz2Source.type === 'col' || dz2Source.type === 'row' || dz2Source.type === 'row_all')) isRelevant = true;
+       }
+
+       if (isRelevant) {
+         // 选中：加粗，放大 (如果之前是灰的，这里会保持灰，但要让它变色吗？通常 hover 会点亮)
+         // 如果用户 hover 了一个灰色的后续层矩阵（如果有的话），这里应该亮起来。
+         // 为了体验，Hover 时强制使用彩色 conf
+         let activeConf = COLOR_MAP.neutral;
+         if (layerName === 'input') activeConf = COLOR_MAP.input;
+         if (layerName.includes('hidden')) activeConf = COLOR_MAP.hidden;
+         if (layerName === 'output') activeConf = COLOR_MAP.output;
+         
+         return `${shapeClass} border-2 ${activeConf.border} ${activeConf.bg} ${activeConf.text} scale-110 shadow-lg font-bold z-50 flex items-center justify-center`;
+       } else {
+         // 未选中：透明度 0.2
+         return `${baseClass} opacity-20 scale-95`;
+       }
+    }
+    
+    return baseClass;
+  };
+
+  const Matrix = ({ data, title, name, isResult, sources }) => {
+    if (!data) return null;
+    const rows = data.length;
+    const cols = data[0].length;
+    const showColHeaders = BATCH_MATRICES.includes(name);
+    const showRowHeaders = TRANSPOSED_MATRICES.includes(name);
+
+    let layerBadge = null;
+    if (['X', 'W1', 'Z1', 'A1', 'dW1', 'dZ1', 'b1'].some(k => name.includes(k))) layerBadge = "L1";
+    if (['W2', 'Z2', 'A2', 'dW2', 'dZ2', 'b2', 'Y'].some(k => name.includes(k))) layerBadge = "L2";
+    if (name === 'X') layerBadge = "In";
+    if (name === 'Y') layerBadge = "GT";
+
+    let badgeColor = "bg-gray-100 text-gray-500";
+    if (layerBadge === "L1") badgeColor = "bg-indigo-100 text-indigo-600";
+    if (layerBadge === "L2") badgeColor = "bg-green-100 text-green-600";
+
+    return (
+      <div className="flex flex-col items-center mx-2 transition-all duration-500">
+        <div className="font-bold text-gray-700 mb-1 flex flex-col items-center">
+          <div className="flex items-center gap-2">
+             <span>{title}</span>
+             {layerBadge && <span className={`text-[10px] px-1.5 py-0.5 rounded-full ${badgeColor}`}>{layerBadge}</span>}
+          </div>
+          <span className="text-xs text-gray-400 font-mono">({rows}, {cols})</span>
+        </div>
+        <div className="flex items-start">
+          {showRowHeaders && (
+            <div className="flex flex-col gap-1 mr-1">
+               {Array.from({length: rows}).map((_, r) => (
+                  <div key={`rh-${r}`} className={`h-8 flex items-center justify-center text-[10px] font-bold px-1 rounded transition-colors ${activeSample === r ? 'bg-orange-500 text-white scale-110 shadow-sm' : 'bg-blue-50 text-blue-500'}`}>S{r+1}</div>
+               ))}
+            </div>
+          )}
+          <div 
+            className="relative border-l-2 border-r-2 border-gray-800 px-1 py-1 bg-white shadow-sm rounded-sm"
+            onMouseLeave={() => setHoverInfo(null)} 
+          >
+            <div className="grid gap-1" style={{ gridTemplateColumns: `repeat(${cols}, minmax(40px, 1fr))` }}>
+              {showColHeaders && Array.from({length: cols}).map((_, c) => (
+                  <div key={`h-${c}`} className={`text-[10px] text-center font-bold rounded mb-0.5 border transition-colors ${activeSample === c ? 'bg-orange-500 text-white border-orange-600 scale-110 shadow-sm' : 'bg-blue-50 text-blue-500 border-blue-100'}`}>S{c+1}</div>
+              ))}
+              {!showColHeaders && Array.from({length: cols}).map((_, c) => <div key={`spacer-${c}`} className="hidden"></div>)}
+
+              {data.map((row, i) => row.map((val, j) => {
+                  let className = THEME.default.className;
+                  if (hoverInfo && hoverInfo.name === name && hoverInfo.row === i && hoverInfo.col === j) {
+                    className = THEME.focus.className; 
+                  } else if (hoverInfo && hoverInfo.sources) {
+                    const sourceRule = hoverInfo.sources.find(s => s.name === name);
+                    if (sourceRule) {
+                        let isMatch = false;
+                        if (sourceRule.type === 'row' && i === hoverInfo.row) isMatch = true;
+                        else if (sourceRule.type === 'col' && j === hoverInfo.col) isMatch = true;
+                        else if (sourceRule.type === 'cell' && i === hoverInfo.row && j === hoverInfo.col) isMatch = true;
+                        else if (sourceRule.type === 'bias' && i === hoverInfo.row) isMatch = true;
+                        else if (sourceRule.type === 'row_all' && i === hoverInfo.row) isMatch = true;
+                        if (isMatch) className = THEME.highlight.className;
+                    }
+                  }
+                  return (
+                    <div key={`${i}-${j}`} className={`h-8 min-w-[40px] flex items-center justify-center text-sm font-mono cursor-default rounded ${className}`}
+                      onMouseEnter={() => setHoverInfo({ row: i, col: j, name, sources })}
+                      onMouseLeave={() => setHoverInfo(null)}>
+                      {val}
+                    </div>
+                  );
+                }))}
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const Operator = ({ symbol }) => <div className="text-2xl text-gray-400 font-bold mx-2 self-center">{symbol}</div>;
+
+  const renderCalculationArea = () => {
+    if (!matrices.X) return <div>Loading...</div>;
+    switch (stepData.id) {
+      case 'init': return <div className="flex items-center"><Matrix data={matrices.X} title="Input" name="X" /><Matrix data={matrices.Y} title="Labels" name="Y" /></div>;
+      case 'z1': return <div className="flex items-center"><Matrix data={matrices.W1} title="W1" name="W1" /><Operator symbol="·" /><Matrix data={matrices.X} title="X" name="X" /><Operator symbol="+" /><Matrix data={matrices.b1} title="b1" name="b1" /><Operator symbol="=" /><Matrix data={matrices.Z1} title="Z1" name="Z1" isResult sources={[{name: 'W1', type: 'row'}, {name: 'X', type: 'col'}, {name: 'b1', type: 'bias'}]} /></div>;
+      case 'a1': return <div className="flex items-center"><span className="text-xl text-gray-500 mr-2">ReLU(</span><Matrix data={matrices.Z1} title="Z1" name="Z1" /><span className="text-xl text-gray-500 ml-2">) =</span><Matrix data={matrices.A1} title="A1" name="A1" isResult sources={[{name: 'Z1', type: 'cell'}]} /></div>;
+      case 'z2': return <div className="flex items-center"><Matrix data={matrices.W2} title="W2" name="W2" /><Operator symbol="·" /><Matrix data={matrices.A1} title="A1" name="A1" /><Operator symbol="+" /><Matrix data={matrices.b2} title="b2" name="b2" /><Operator symbol="=" /><Matrix data={matrices.Z2} title="Z2" name="Z2" isResult sources={[{name: 'W2', type: 'row'}, {name: 'A1', type: 'col'}, {name: 'b2', type: 'bias'}]} /></div>;
+      case 'a2': return <div className="flex items-center"><span className="text-xl text-gray-500 mr-2">σ(</span><Matrix data={matrices.Z2} title="Z2" name="Z2" /><span className="text-xl text-gray-500 ml-2">) =</span><Matrix data={matrices.A2} title="A2" name="A2" isResult sources={[{name: 'Z2', type: 'cell'}]} /></div>;
+      case 'loss': return <div className="flex flex-col items-center"><div className="flex mb-4"><Matrix data={matrices.A2} title="Prediction" name="A2" /><span className="mx-4 self-center">vs</span><Matrix data={matrices.Y} title="Truth" name="Y" /></div><div className="text-red-500 font-bold">Computing Loss...</div></div>;
+      case 'dz2': return <div className="flex items-center"><Matrix data={matrices.A2} title="A2" name="A2" /><Operator symbol="-" /><Matrix data={matrices.Y} title="Y" name="Y" /><Operator symbol="=" /><Matrix data={matrices.dZ2} title="dZ2" name="dZ2" isResult sources={[{name: 'A2', type: 'cell'}, {name: 'Y', type: 'cell'}]} /></div>;
+      case 'dw2': return <div className="flex items-center"><Matrix data={matrices.dZ2} title="dZ2" name="dZ2" /><Operator symbol="·" /><div className="flex flex-col items-center p-2 border-2 border-dashed border-yellow-400 bg-yellow-50 rounded"><span className="text-xs text-yellow-600 font-bold">TRANSPOSED</span><Matrix data={matrices.A1_T} title="A1^T" name="A1_T" /></div><Operator symbol="=" /><Matrix data={matrices.dW2} title="dW2" name="dW2" isResult sources={[{name: 'dZ2', type: 'row'}, {name: 'A1_T', type: 'col'}]} /></div>;
+      case 'db2': return <div className="flex items-center"><div className="text-center"><div className="text-xs text-gray-400 mb-1">Row Sum</div><Matrix data={matrices.dZ2} title="dZ2" name="dZ2" /></div><Operator symbol="→" /><Matrix data={matrices.db2} title="db2" name="db2" isResult sources={[{name: 'dZ2', type: 'row_all'}]} /></div>;
+      case 'dz1': return <div className="flex items-center"><Matrix data={matrices.W2_T} title="W2^T" name="W2_T" /><Operator symbol="·" /><Matrix data={matrices.dZ2} title="dZ2" name="dZ2" /><Operator symbol="*" /><span className="mx-1">g'</span><Operator symbol="=" /><Matrix data={matrices.dZ1} title="dZ1" name="dZ1" isResult sources={[{name: 'W2_T', type: 'row'}, {name: 'dZ2', type: 'col'}]} /></div>;
+      case 'dw1': return <div className="flex items-center"><Matrix data={matrices.dZ1} title="dZ1" name="dZ1" /><Operator symbol="·" /><div className="flex flex-col items-center p-2 border-2 border-dashed border-yellow-400 bg-yellow-50 rounded"><span className="text-xs text-yellow-600 font-bold">TRANSPOSED</span><Matrix data={matrices.X_T} title="X^T" name="X_T" /></div><Operator symbol="=" /><Matrix data={matrices.dW1} title="dW1" name="dW1" isResult sources={[{name: 'dZ1', type: 'row'}, {name: 'X_T', type: 'col'}]} /></div>;
+      default: return <div>Unknown Step</div>;
+    }
+  };
+
+  return (
+    <div className="flex flex-col h-screen bg-gray-50 text-gray-900 font-sans overflow-hidden">
+      <style>{`
+        @keyframes dash { to { stroke-dashoffset: -10; } }
+        @keyframes dash-reverse { to { stroke-dashoffset: 10; } }
+      `}</style>
+      <header className="bg-white border-b border-gray-200 px-6 py-4 flex justify-between items-center shadow-sm z-10">
+        <div>
+          <h1 className="text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-600 to-indigo-600">
+            神经网络矩阵计算可视化
+          </h1>
+          <p className="text-sm text-gray-500">动态演示前向与反向传播中的维度变化与误差流动</p>
+        </div>
+        <div className="flex items-center gap-4">
+          <div className="text-right">
+            <div className="text-sm font-semibold text-gray-800">{stepData.title}</div>
+            <div className="text-xs text-gray-500 font-mono">{stepData.formula || ''}</div>
+          </div>
+          <button onClick={() => setCurrentStep(0)} className="p-2 hover:bg-gray-100 rounded-full text-gray-600"><RefreshCw size={20}/></button>
+          <button onClick={() => setCurrentStep(s => Math.max(0, s-1))} disabled={currentStep === 0} className="p-2 hover:bg-gray-100 rounded-full text-gray-600 disabled:opacity-30"><ChevronLeft size={24}/></button>
+          <button onClick={() => setIsPlaying(!isPlaying)} className={`p-3 rounded-full text-white shadow-lg transition-all ${isPlaying ? 'bg-red-500' : 'bg-blue-600'}`}>{isPlaying ? <Pause size={20} fill="currentColor"/> : <Play size={20} fill="currentColor"/>}</button>
+          <button onClick={() => setCurrentStep(s => Math.min(STEPS.length-1, s+1))} disabled={currentStep === STEPS.length-1} className="p-2 hover:bg-gray-100 rounded-full text-gray-600 disabled:opacity-30"><ChevronRight size={24}/></button>
+        </div>
+      </header>
+
+      <div className="flex flex-1 overflow-hidden">
+        {/* Left Panel: Network Graph */}
+        <div className="w-1/3 bg-white border-r border-gray-200 p-6 flex flex-col relative z-0">
+          <h3 className="text-xs font-bold text-gray-400 uppercase mb-4 tracking-wider text-center">Network Architecture</h3>
+          
+          <div className="flex-1 w-full relative">
+            {/* SVG Definitions for Arrows */}
+            <svg className="absolute inset-0 w-full h-full pointer-events-none z-0">
+              <defs>
+                <marker id="arrow-forward" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto" markerUnits="strokeWidth">
+                  <path d="M0,0 L0,6 L6,3 z" fill="#3b82f6" />
+                </marker>
+                <marker id="arrow-backward" markerWidth="6" markerHeight="6" refX="1" refY="3" orient="auto" markerUnits="strokeWidth">
+                  <path d="M6,0 L6,6 L0,3 z" fill="#ef4444" />
+                </marker>
+                
+                <marker id="arrow-highlight-focus" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L6,3 z" fill={THEME.focus.stroke} /></marker>
+                <marker id="arrow-highlight-highlight" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L6,3 z" fill={THEME.highlight.stroke} /></marker>
+
+                <marker id="arrow-highlight-back-focus" markerWidth="6" markerHeight="6" refX="1" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M6,0 L6,6 L0,3 z" fill={THEME.focus.stroke} /></marker>
+                <marker id="arrow-highlight-back-highlight" markerWidth="6" markerHeight="6" refX="1" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M6,0 L6,6 L0,3 z" fill={THEME.highlight.stroke} /></marker>
+              </defs>
+
+              {/* Connections */}
+              {NODES.input.map((start, i) => NODES.hidden_z.map((end, j) => {
+                  const style = getLineStyle(0, i, j);
+                  return <line key={`l0-${i}-${j}`} x1={`${start.x}%`} y1={`${start.y}%`} x2={`${end.x}%`} y2={`${end.y}%`} stroke={style.stroke} strokeWidth={style.strokeWidth} strokeDasharray={style.strokeDasharray} markerEnd={style.markerEnd} markerStart={style.markerStart} style={{ transition: 'all 0.3s ease', animation: style.animation, opacity: style.opacity, zIndex: style.zIndex }} />
+              }))}
+              
+              {NODES.hidden_z.map((start, i) => NODES.hidden_a.map((end, j) => {
+                  if (i !== j) return null;
+                  const style = getLineStyle(1, i, j);
+                  return <line key={`l1-${i}-${j}`} x1={`${start.x}%`} y1={`${start.y}%`} x2={`${end.x}%`} y2={`${end.y}%`} stroke={style.stroke} strokeWidth={style.strokeWidth} strokeDasharray={style.strokeDasharray} markerEnd={style.markerEnd} markerStart={style.markerStart} style={{ transition: 'all 0.3s ease', animation: style.animation, opacity: style.opacity, zIndex: style.zIndex }} />
+              }))}
+
+              {NODES.hidden_a.map((start, i) => NODES.output.map((end, j) => {
+                  const style = getLineStyle(2, i, j);
+                  return <line key={`l2-${i}-${j}`} x1={`${start.x}%`} y1={`${start.y}%`} x2={`${end.x}%`} y2={`${end.y}%`} stroke={style.stroke} strokeWidth={style.strokeWidth} strokeDasharray={style.strokeDasharray} markerEnd={style.markerEnd} markerStart={style.markerStart} style={{ transition: 'all 0.3s ease', animation: style.animation, opacity: style.opacity, zIndex: style.zIndex }} />
+              }))}
+            </svg>
+
+            {/* Nodes Render (Subscripts) */}
+            {NODES.input.map((node, i) => (
+              <div key={`in-${i}`} className={`absolute w-10 h-10 ${getNodeStyle('input', i)}`} style={{ left: `${node.x}%`, top: `${node.y}%` }}>
+                <span className="text-xs font-serif italic">x<sub className="not-italic font-sans text-[10px]">{i+1}</sub></span>
+              </div>
+            ))}
+            
+            {NODES.hidden_z.map((node, i) => (
+               <div key={`hz-${i}`} className={`absolute w-8 h-8 ${getNodeStyle('hidden_z', i)}`} style={{ left: `${node.x}%`, top: `${node.y}%` }}>
+                 <span className="text-xs font-serif italic">z<sub className="not-italic font-sans text-[9px]">{i+1}</sub></span>
+               </div>
+            ))}
+            
+            {NODES.hidden_a.map((node, i) => (
+               <div key={`ha-${i}`} className={`absolute w-8 h-8 ${getNodeStyle('hidden_a', i)}`} style={{ left: `${node.x}%`, top: `${node.y}%` }}>
+                 <span className="text-xs font-serif italic">a<sub className="not-italic font-sans text-[9px]">{i+1}</sub></span>
+               </div>
+            ))}
+
+            {NODES.output.map((node, i) => (
+               <div key={`out-${i}`} className={`absolute w-12 h-12 ${getNodeStyle('output', i)}`} style={{ left: `${node.x}%`, top: `${node.y}%` }}>
+                 <span className="text-xs font-serif italic">y^</span>
+               </div>
+            ))}
+
+            {/* Batch/Sample Indicator */}
+            <div className="absolute text-center flex flex-col items-center -translate-x-1/2 transition-all duration-300" style={{ left: '10%', top: '15%' }}>
+                 <div className="relative w-8 h-8 mb-1">
+                    <div className={`absolute top-0 left-0 w-6 h-6 border rounded shadow-sm z-0 translate-x-2 translate-y-2 transition-colors duration-300 ${activeSample !== null && activeSample !== 2 ? 'bg-gray-100 border-gray-200' : 'bg-blue-100 border-blue-300'}`}></div>
+                    <div className={`absolute top-0 left-0 w-6 h-6 border rounded shadow-sm z-10 translate-x-1 translate-y-1 transition-colors duration-300 ${activeSample !== null && activeSample !== 1 ? 'bg-gray-100 border-gray-200' : 'bg-blue-200 border-blue-400'}`}></div>
+                    <div className={`absolute top-0 left-0 w-6 h-6 border rounded shadow-sm z-20 flex items-center justify-center text-[10px] font-bold transition-all duration-300 ${activeSample !== null ? 'bg-orange-500 border-orange-600 text-white scale-110' : 'bg-blue-500 border-blue-600 text-white'}`}>{activeSample !== null ? `S${activeSample + 1}` : 'm=3'}</div>
+                 </div>
+                 <div className={`text-[10px] font-semibold bg-white/80 px-1 rounded transition-colors duration-300 ${activeSample !== null ? 'text-orange-600' : 'text-gray-500'}`}>{activeSample !== null ? `Sample ${activeSample + 1}` : 'Batch'}</div>
+            </div>
+
+            <div className="absolute text-[10px] text-gray-400 -translate-x-1/2 font-medium" style={{ left: '10%', top: '75%' }}>Input</div>
+            <div className="absolute text-[10px] text-gray-400 -translate-x-1/2 font-medium" style={{ left: '40%', top: '90%' }}>Linear (Z)</div>
+            <div className="absolute text-[10px] text-gray-400 -translate-x-1/2 font-medium" style={{ left: '60%', top: '90%' }}>ReLU (A)</div>
+            <div className="absolute text-[10px] text-gray-400 -translate-x-1/2 font-medium" style={{ left: '90%', top: '60%' }}>Output</div>
+            <div className="absolute text-gray-300 -translate-x-1/2 -translate-y-1/2" style={{ left: '50%', top: '50%' }}><ArrowRight size={16} /></div>
+          </div>
+
+          {/* Intuition Box */}
+          <div className="mt-4 p-3 bg-yellow-50 rounded-lg text-sm text-gray-700 w-full border border-yellow-200 z-10 shadow-sm">
+            <h4 className="font-bold text-yellow-800 mb-1 flex items-center text-xs uppercase tracking-wider"><Info size={12} className="mr-1"/> 直观解读</h4>
+            <p className="text-xs leading-relaxed whitespace-pre-line">{stepData.intuition}</p>
+            {hoverInfo && (
+               <div className="mt-2 pt-2 border-t border-yellow-100 text-xs text-orange-600 font-semibold">
+                  ⚡ 正在查看: {hoverInfo.name} [{hoverInfo.row}, {hoverInfo.col}]
+               </div>
+            )}
+          </div>
+        </div>
+
+        {/* Right Panel: Matrix Calculations */}
+        <div 
+          className="flex-1 bg-gray-100 flex flex-col p-8 overflow-auto relative"
+          onMouseLeave={() => setHoverInfo(null)} // Global safety clear
+        >
+           <div className="absolute inset-0 opacity-5 pointer-events-none" style={{backgroundImage: 'radial-gradient(#444 1px, transparent 1px)', backgroundSize: '20px 20px'}}></div>
+           <div className="bg-white rounded-xl shadow-lg border border-gray-200 flex-1 flex flex-col p-6 z-0">
+              <div className="flex justify-between items-center mb-6 border-b border-gray-100 pb-4">
+                 <h2 className="text-lg font-bold text-gray-800 flex items-center"><div className="w-2 h-6 bg-indigo-500 mr-2 rounded-sm"></div>矩阵运算台</h2>
+                 <div className="flex gap-4 text-xs">
+                    <span className="flex items-center text-blue-600 font-medium"><span className="w-2 h-2 bg-blue-500 rounded-full mr-1"></span>S1-S3: 样本列</span>
+                 </div>
+              </div>
+              <div className="flex-1 flex justify-center items-center overflow-auto scale-90 origin-center">
+                 {renderCalculationArea()}
+              </div>
+           </div>
+        </div>
+      </div>
+    </div>
+  );
+}
